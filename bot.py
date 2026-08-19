@@ -97,7 +97,6 @@ def get_tutti_iscritti():
     return [row[0] for row in cursor.fetchall()]
 
 
-# --- 3. SCRAPING BOLLETTINO ---
 def cerca_nel_bollettino() -> str:
   headers = {
       "User-Agent": (
@@ -119,60 +118,96 @@ def cerca_nel_bollettino() -> str:
 
   soup = BeautifulSoup(response.text, "html.parser")
 
-  # Estrazione dell'intestazione/data del Bollettino dalla pagina HTML
-  intestazione_bollettino = ""
+  # 1. ESTRAZIONE PULITA DELLA DATA / NUMERO BOLLETTINO
+  intestazione_bollettino = "Bollettino Ufficiale - Regione Piemonte"
+  testo_completo = soup.get_text(" ", strip=True)
+
+  # Cerca "Bollettino Ufficiale [Supplemento] n. X del GG mese AAAA"
   match_data = re.search(
-      r"Bollettino\s+Ufficiale\s+n\.\s*\d+\s+del\s+[0-9a-zA-Z\s]+",
-      soup.get_text(),
+      r"Bollettino\s+Ufficiale(?:\s+ordinario|\s+straordinario|\s+speciale|\s+supplemento)?\s+n\.?\s*\d+(?:\s+del|\s+Supplemento\s+n\.?\s*\d+\s+del)?\s+\d{1,2}\s+[a-zA-ZÀ-ÿ]+\s+\d{4}",
+      testo_completo,
       re.IGNORECASE,
   )
+
   if match_data:
-    intestazione_bollettino = (
-        match_data.group(0).replace("\n", " ").strip()
-    )  # Pulisce eventuali a capo
+    intestazione_bollettino = re.sub(r"\s+", " ", match_data.group(0)).strip()
   else:
-    # Fallback se non trovato nell'HTML
-    intestazione_bollettino = (
-        "Bollettino Ufficiale - Sezione Concorsi (Data non rilevata)"
-    )
+    # Fallback se non trova il pattern completo
+    first_heading = soup.find(["h1", "h2", "h3", "title"])
+    if first_heading:
+      intestazione_bollettino = first_heading.get_text(" ", strip=True)
+
+  # 2. RICERCA ATTI E CONCORSI
+  # Cerca nei contenitori tipici degli atti (elementi di lista, paragrafi o righe tabella)
+  contenitori = soup.find_all(["li", "p", "tr"])
+  trovati = []
+  link_visti = set()
+
+  for elemento in contenitori:
+    testo_elemento = elemento.get_text(" ", strip=True)
+
+    # Verifica se la parola chiave è presente nel testo del bando
+    if KEYWORD.lower() in testo_elemento.lower():
+      # Cerca se dentro questo blocco c'è un link all'atto
+      link_tag = elemento.find("a")
+      if link_tag and link_tag.get("href"):
+        link_completo = urljoin(URL_BOLLETTINO, link_tag.get("href"))
+      else:
+        # Se non c'è un link interno, rimanda alla pagina del bollettino
+        link_completo = URL_BOLLETTINO
+
+      # Evita duplicati se lo stesso atto compare in tag annidati
+      if link_completo not in link_visti or link_completo == URL_BOLLETTINO:
+        # Pulisce gli spazi e tronca descrizioni eccessivamente lunghe
+        testo_pulito = re.sub(r"\s+", " ", testo_elemento).strip()
+        if len(testo_pulito) > 300:
+          testo_pulito = testo_pulito[:297] + "..."
+
+        testo_escape = html.escape(testo_pulito)
+        trovati.append(
+            f"• <a href='{link_completo}'>{testo_escape}</a>\n  🔗 <a"
+            f" href='{link_completo}'>Apri documento</a>"
+        )
+        link_visti.add(link_completo)
+
+  # Se non trova nei contenitori a blocchi, fallback su ricerca classica dei link diretti
+  if not trovati:
+    for link in soup.find_all("a"):
+      testo_link = link.get_text(" ", strip=True)
+      href = link.get("href", "")
+      if (
+          KEYWORD.lower() in testo_link.lower()
+          and href
+          and href not in link_visti
+      ):
+        link_completo = urljoin(URL_BOLLETTINO, href)
+        trovati.append(f"• <a href='{link_completo}'>{html.escape(testo_link)}</a>")
+        link_visti.add(href)
 
   data_controllo = datetime.now(TIMEZONE).strftime("%d/%m/%Y %H:%M")
-  trovati = []
 
-  # Ricerca di link contenenti la parola chiave
-  for link in soup.find_all("a"):
-    testo = link.get_text(" ", strip=True)
-    href = link.get("href", "")
-
-    if not href or not testo:
-      continue
-
-    if KEYWORD.lower() in testo.lower():
-      link_completo = urljoin(URL_BOLLETTINO, href)
-      testo_pulito = html.escape(testo)
-      trovati.append(f"• <a href='{link_completo}'>{testo_pulito}</a>")
-
+  # 3. FORMATTAZIONE DEL MESSAGGIO
   if trovati:
     risultati = "\n\n".join(trovati)
     messaggio = (
         f"📋 <b>{html.escape(intestazione_bollettino)}</b>\n"
-        f"🕒 Controllo effettuato il: <b>{data_controllo}</b>\n\n"
-        f"🔍 Risultati per <i>'{KEYWORD}'</i> ({len(trovati)} trovati):\n\n"
+        f"🕒 <i>Verificato il: {data_controllo}</i>\n\n"
+        f"🔍 <b>Trovati {len(trovati)} atti per '{KEYWORD}':</b>\n\n"
         f"{risultati}"
     )
     if len(messaggio) > 4000:
       messaggio = (
-          messaggio[:3950] + "\n\n... <i>(ulteriori risultati sul sito web)</i>"
+          messaggio[:3900]
+          + f"\n\n... <i>(visualizza gli altri sul <a href='{URL_BOLLETTINO}'>sito del Bollettino</a>)</i>"
       )
     return messaggio
   else:
     return (
         f"📋 <b>{html.escape(intestazione_bollettino)}</b>\n"
-        f"🕒 Controllo effettuato il: <b>{data_controllo}</b>\n\n"
-        f"ℹ️ Nessun concorso contenente la parola <b>'{KEYWORD}'</b> trovato"
-        " nell'edizione corrente."
+        f"🕒 <i>Verificato il: {data_controllo}</i>\n\n"
+        f"ℹ️ Nessun concorso o atto contenente la parola <b>'{KEYWORD}'</b>"
+        " trovato nell'edizione corrente."
     )
-
 
 def invia_notifica_programmata():
   logger.info("Esecuzione invio programmato del giovedì...")
