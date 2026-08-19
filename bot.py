@@ -14,7 +14,7 @@ from flask import Flask
 
 # --- CONFIGURAZIONE ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8769617935:AAErJVJn_FVNOQCWlL3EcaqPZ_0MFXqA20A")
-URL_BOLLETTINO = "https://www.regione.piemonte.it/governo/bollettino/abbonati/2026/corrente/"
+URL_BOLLETTINO = "https://www.regione.piemonte.it/governo/bollettino/abbonati/2026/corrente/index.htm"
 KEYWORD = "chirurgia"
 DB_FILE = "iscritti.db"
 TIMEZONE = pytz.timezone("Europe/Rome")
