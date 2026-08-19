@@ -15,15 +15,14 @@ import pytz
 import requests
 import telebot
 
-# Carica le variabili d'ambiente dal file .env (se presente)
+# Carica il file .env per non esporre il token
 load_dotenv()
 
-# --- CONFIGURAZIONE ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
   raise ValueError(
-      "BOT_TOKEN mancante! Impostalo nelle variabili d'ambiente o nel file"
-      " .env"
+      "Errore: BOT_TOKEN mancante. Impostalo nel file .env o nelle variabili"
+      " d'ambiente."
   )
 
 URL_BOLLETTINO = "https://www.regione.piemonte.it/governo/bollettino/abbonati/2026/corrente/concorsi/index.htm"
@@ -44,7 +43,7 @@ log_flask = logging.getLogger("werkzeug")
 log_flask.setLevel(logging.ERROR)
 
 
-# --- 1. SERVER FLASK (Anti-Bad Gateway) ---
+# --- 1. SERVER FLASK (Anti-Bad Gateway per hosting come Render) ---
 @app.route("/")
 @app.route("/health")
 def health_check():
@@ -97,6 +96,29 @@ def get_tutti_iscritti():
     return [row[0] for row in cursor.fetchall()]
 
 
+# --- 3. SCRAPING BOLLETTINO ---
+def estrai_data_bollettino(soup: BeautifulSoup) -> str:
+  """Estrae con precisione la testata con numero e data senza catturare il corpo della pagina."""
+  testo = soup.get_text("\n", strip=True)
+
+  # Cerca la dicitura precisa "Bollettino Ufficiale n. X del GG Mese AAAA"
+  match = re.search(
+      r"Bollettino\s+Ufficiale[^\n\r]*?n\.?\s*\d+[^\n\r]*?del\s+\d{1,2}\s+[a-zA-ZÀ-ÿ]+\s+\d{4}",
+      testo,
+      re.IGNORECASE,
+  )
+  if match:
+    return re.sub(r"\s+", " ", match.group(0)).strip()
+
+  # Fallback sul primo elemento di intestazione valido
+  for h in soup.find_all(["h1", "h2", "caption", "p"]):
+    t = h.get_text(" ", strip=True)
+    if "bollettino" in t.lower():
+      return t[:100]
+
+  return "Bollettino Ufficiale - Regione Piemonte"
+
+
 def cerca_nel_bollettino() -> str:
   headers = {
       "User-Agent": (
@@ -112,88 +134,96 @@ def cerca_nel_bollettino() -> str:
   except requests.RequestException as e:
     logger.error(f"Errore connessione bollettino: {e}")
     return (
-        f"⚠️ <b>Errore:</b> Impossibile raggiungere la pagina del"
-        f" bollettino.\n<code>{e}</code>"
+        f"⚠️ <b>Errore:</b> Impossibile raggiungere il sito del"
+        f" Bollettino.\n<code>{e}</code>"
     )
 
   soup = BeautifulSoup(response.text, "html.parser")
+  intestazione_bollettino = estrai_data_bollettino(soup)
 
-  # 1. Estrazione intestazione/data
-  intestazione_bollettino = "Bollettino Ufficiale - Regione Piemonte"
-  testo_pagina = soup.get_text(" ", strip=True)
-  match_data = re.search(
-      r"Bollettino\s+Ufficiale(?:\s+ordinario|\s+straordinario|\s+speciale|\s+supplemento)?\s+n\.?\s*\d+(?:\s+del|\s+Supplemento\s+n\.?\s*\d+\s+del)?\s+\d{1,2}\s+[a-zA-ZÀ-ÿ]+\s+\d{4}",
-      testo_pagina,
-      re.IGNORECASE,
-  )
-  if match_data:
-    intestazione_bollettino = re.sub(r"\s+", " ", match_data.group(0)).strip()
-
-  # 2. Ricerca mirata sui singoli link degli atti
   trovati = []
-  link_registrati = set()
+  link_univoci = set()
 
+  # Strategia: iterare su ogni link concreto a un atto escludendo pagine indice o menu
   for a_tag in soup.find_all("a", href=True):
-    href = a_tag.get("href", "")
+    href = a_tag.get("href", "").strip()
 
-    # Esclude ancore interne, link di navigazione o pagine indice
-    if href.startswith("#") or "javascript" in href or "index" in href:
+    # Ignora ancore, js, mailto e link alla home/indice
+    if (
+        not href
+        or href.startswith("#")
+        or "javascript" in href.lower()
+        or href.lower().endswith("index.htm")
+        or href.lower().endswith("index.html")
+    ):
       continue
 
-    # Recupera il testo dell'elemento o del suo contenitore immediato (li, p, dt, dd)
-    parent = a_tag.find_parent(["li", "p", "dt", "dd", "td"])
-    if parent:
-      testo_atto = parent.get_text(" ", strip=True)
-    else:
-      testo_atto = a_tag.get_text(" ", strip=True)
+    # 1. Testo dentro il tag <a>
+    testo_link = a_tag.get_text(" ", strip=True)
 
-    # Verifica se la parola chiave è presente
-    if KEYWORD.lower() in testo_atto.lower():
+    # 2. Testo circostante immediato (senza risalire a contenitori enormi)
+    testo_contesto = ""
+
+    # Se <a> è dentro un <li>, prendiamo solo quel singolo <li>
+    if a_tag.parent and a_tag.parent.name == "li":
+      testo_contesto = a_tag.parent.get_text(" ", strip=True)
+    # Se <a> è dentro un <p>, prendiamo solo quel singolo <p>
+    elif a_tag.parent and a_tag.parent.name == "p":
+      testo_contesto = a_tag.parent.get_text(" ", strip=True)
+    else:
+      testo_contesto = testo_link
+
+    # Combiniamo i testi pertinenti del singolo bando
+    testo_bando = (
+        testo_contesto if len(testo_contesto) > len(testo_link) else testo_link
+    )
+
+    # Controllo presenza parola chiave
+    if KEYWORD.lower() in testo_bando.lower():
       link_completo = urljoin(URL_BOLLETTINO, href)
 
-      if link_completo in link_registrati:
+      # Evita duplicati dello stesso atto
+      if link_completo in link_univoci:
         continue
-      link_registrati.add(link_completo)
+      link_univoci.add(link_completo)
 
-      # Pulizia spaziature
-      testo_pulito = re.sub(r"\s+", " ", testo_atto).strip()
-      if len(testo_pulito) > 300:
-        testo_pulito = testo_pulito[:297] + "..."
+      # Pulizia spaziature e rimozione a capo multipli
+      testo_pulito = re.sub(r"\s+", " ", testo_bando).strip()
+      if len(testo_pulito) > 350:
+        testo_pulito = testo_pulito[:347] + "..."
 
       trovati.append(
-          f"🔹 <b>Concorso/Avviso:</b>\n"
-          f"{html.escape(testo_pulito)}\n"
-          f"👉 <a href='{link_completo}'>Apri bando completo</a>"
+          f"• <b>Atto:</b> {html.escape(testo_pulito)}\n  👉 <a"
+          f" href='{link_completo}'>Apri documento</a>"
       )
 
   data_controllo = datetime.now(TIMEZONE).strftime("%d/%m/%Y %H:%M")
 
-  # 3. Composizione messaggio
   if trovati:
     risultati = "\n\n".join(trovati)
     messaggio = (
         f"📋 <b>{html.escape(intestazione_bollettino)}</b>\n"
-        f"🕒 <i>Verificato il: {data_controllo}</i>\n\n"
+        f"🕒 <i>Aggiornato al: {data_controllo}</i>\n\n"
         f"🔍 <b>Trovati {len(trovati)} atti per '{KEYWORD}':</b>\n\n"
         f"{risultati}"
     )
     if len(messaggio) > 4000:
       messaggio = (
           messaggio[:3900]
-          + f"\n\n... <i>(ulteriori risultati sul <a href='{URL_BOLLETTINO}'>sito</a>)</i>"
+          + f"\n\n... <i>(ulteriori risultati sul <a href='{URL_BOLLETTINO}'>sito del Bollettino</a>)</i>"
       )
     return messaggio
   else:
     return (
         f"📋 <b>{html.escape(intestazione_bollettino)}</b>\n"
-        f"🕒 <i>Verificato il: {data_controllo}</i>\n\n"
+        f"🕒 <i>Aggiornato al: {data_controllo}</i>\n\n"
         f"ℹ️ Nessun concorso o atto contenente la parola <b>'{KEYWORD}'</b>"
         " trovato nell'edizione corrente."
     )
 
 
 def invia_notifica_programmata():
-  logger.info("Esecuzione invio programmato del giovedì...")
+  logger.info("Esecuzione notifica automatica...")
   messaggio = cerca_nel_bollettino()
   iscritti = get_tutti_iscritti()
 
@@ -220,15 +250,15 @@ def comando_start(message):
         f"Sei iscritto agli aggiornamenti per la parola <i>'{KEYWORD}'</i> nella"
         " sezione <b>Concorsi</b>.\n"
         "Riceverai una notifica automatica <b>ogni giovedì alle 10:00</b>.\n\n"
-        "<b>Comandi:</b>\n"
+        "<b>Comandi disponibili:</b>\n"
         "👉 /cerca - Controlla subito i concorsi correnti\n"
         "👉 /stop - Cancella la tua iscrizione"
     )
   else:
     testo = (
-        "Sei già iscritto!\n"
-        "Riceverai gli avvisi ogni giovedì alle 10:00.\n\n"
-        "Usa /cerca per verificare ora o /stop per cancellarti."
+        "Sei già iscritto al servizio!\n\n"
+        "👉 Usa /cerca per controllare subito il bollettino\n"
+        "👉 Usa /stop per annullare l'iscrizione"
     )
   bot.send_message(chat_id, testo, parse_mode="HTML")
 
@@ -237,8 +267,7 @@ def comando_start(message):
 def comando_stop(message):
   if rimuovi_utente(message.chat.id):
     bot.send_message(
-        message.chat.id,
-        "❌ Ti sei disiscritto dal servizio. Non riceverai più notifiche.",
+        message.chat.id, "❌ Ti sei disiscritto. Non riceverai più notifiche."
     )
   else:
     bot.send_message(
@@ -249,7 +278,7 @@ def comando_stop(message):
 @bot.message_handler(commands=["cerca"])
 def comando_cerca(message):
   bot.send_message(
-      message.chat.id, "🔍 Controllo in corso sulla sezione Concorsi..."
+      message.chat.id, "🔍 Controllo in corso sul Bollettino Ufficiale..."
   )
   esito = cerca_nel_bollettino()
   bot.send_message(
@@ -257,19 +286,16 @@ def comando_cerca(message):
   )
 
 
-# --- 5. LOOP RESILIENTE TELEGRAM ---
+# --- 5. LOOP TELEGRAM RESILIENTE ---
 def avvia_polling_sicuro():
   while True:
     try:
-      logger.info("Avvio connessione con i server di Telegram...")
+      logger.info("Connessione con Telegram avviata...")
       bot.infinity_polling(
           timeout=20, long_polling_timeout=10, skip_pending=True
       )
     except Exception as err:
-      logger.error(
-          f"Errore nel polling: {err}. Riconnessione automatica tra 5"
-          " secondi..."
-      )
+      logger.error(f"Errore polling: {err}. Riconnessione tra 5 secondi...")
       time.sleep(5)
 
 
@@ -277,17 +303,17 @@ def avvia_polling_sicuro():
 if __name__ == "__main__":
   init_db()
 
-  # 1. Avvia Scheduler
+  # Scheduler per il giovedì alle 10:00
   scheduler = BackgroundScheduler(timezone=TIMEZONE)
   scheduler.add_job(
       invia_notifica_programmata, "cron", day_of_week="thu", hour=10, minute=0
   )
   scheduler.start()
 
-  # 2. Avvia Telegram in un thread protetto
+  # Thread Telegram
   threading.Thread(target=avvia_polling_sicuro, daemon=True).start()
 
-  # 3. Avvia Flask sul thread principale per Render
+  # Server Flask
   porta = int(os.getenv("PORT", 10000))
-  logger.info(f"Avvio server Web Flask sulla porta {porta}")
+  logger.info(f"Avvio Flask sulla porta {porta}")
   app.run(host="0.0.0.0", port=porta)
