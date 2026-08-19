@@ -118,108 +118,91 @@ def estrai_data_bollettino(soup: BeautifulSoup) -> str:
 
   return "Bollettino Ufficiale - Regione Piemonte"
 
-
 def cerca_nel_bollettino() -> str:
-  headers = {
-      "User-Agent": (
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,"
-          " like Gecko) Chrome/120.0.0.0 Safari/537.36"
-      )
-  }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    
+    try:
+        response = requests.get(URL_BOLLETTINO, headers=headers, timeout=20)
+        response.raise_for_status()
+        # Il Bollettino Piemonte usa la codifica ISO-8859-1 / Latin-1 per le lettere accentate e virgolette
+        response.encoding = 'iso-8859-1'
+    except requests.RequestException as e:
+        logger.error(f"Errore connessione bollettino: {e}")
+        return f"⚠️ <b>Errore:</b> Impossibile raggiungere il sito del Bollettino.\n<code>{e}</code>"
 
-  try:
-    response = requests.get(URL_BOLLETTINO, headers=headers, timeout=20)
-    response.raise_for_status()
-    response.encoding = response.apparent_encoding
-  except requests.RequestException as e:
-    logger.error(f"Errore connessione bollettino: {e}")
-    return (
-        f"⚠️ <b>Errore:</b> Impossibile raggiungere il sito del"
-        f" Bollettino.\n<code>{e}</code>"
-    )
+    soup = BeautifulSoup(response.text, "html.parser")
+    intestazione_bollettino = estrai_data_bollettino(soup)
 
-  soup = BeautifulSoup(response.text, "html.parser")
-  intestazione_bollettino = estrai_data_bollettino(soup)
+    trovati = []
+    link_univoci = set()
 
-  trovati = []
-  link_univoci = set()
+    # Cerca tutti i link che portano a un file/dettaglio atto (.htm, .html, .pdf, .rtf)
+    for a_tag in soup.find_all("a", href=True):
+        href = a_tag.get("href", "").strip()
+        
+        # Ignora ancore interne, javascript e pagine indice generali
+        if not href or href.startswith("#") or "javascript" in href.lower() or "index" in href.lower():
+            continue
 
-  # Strategia: iterare su ogni link concreto a un atto escludendo pagine indice o menu
-  for a_tag in soup.find_all("a", href=True):
-    href = a_tag.get("href", "").strip()
+        link_completo = urljoin(URL_BOLLETTINO, href)
+        if link_completo in link_univoci:
+            continue
 
-    # Ignora ancore, js, mailto e link alla home/indice
-    if (
-        not href
-        or href.startswith("#")
-        or "javascript" in href.lower()
-        or href.lower().endswith("index.htm")
-        or href.lower().endswith("index.html")
-    ):
-      continue
+        # RECUPERO DEL TESTO DEL SINGOLO BANDO:
+        # 1. Se il testo è dentro al tag <a> stesso
+        testo_singolo = a_tag.get_text(" ", strip=True)
+        
+        # 2. Se <a> è solo un pulsante/codice (es. "Scarica", o codice atto),
+        # raccogliamo il testo immediatamente precedente risalendo fino al bando precedente
+        if len(testo_singolo) < 15:
+            parti_testo = []
+            for prev in a_tag.previous_siblings:
+                # Se incontra un altro link, un'interruzione di sezione <hr> o intestazioni di tabella, si ferma
+                if getattr(prev, 'name', None) in ['a', 'hr', 'h1', 'h2', 'h3', 'table']:
+                    break
+                t = prev.get_text(" ", strip=True) if hasattr(prev, 'get_text') else str(prev).strip()
+                if t:
+                    parti_testo.insert(0, t)
+            
+            if parti_testo:
+                testo_singolo = " ".join(parti_testo)
 
-    # 1. Testo dentro il tag <a>
-    testo_link = a_tag.get_text(" ", strip=True)
+        # Pulizia caratteri di spaziatura
+        testo_singolo = re.sub(r"\s+", " ", testo_singolo).strip()
 
-    # 2. Testo circostante immediato (senza risalire a contenitori enormi)
-    testo_contesto = ""
+        # Verifica se la parola chiave è presente nel singolo bando
+        if KEYWORD.lower() in testo_singolo.lower():
+            link_univoci.add(link_completo)
+            
+            if len(testo_singolo) > 350:
+                testo_singolo = testo_singolo[:347] + "..."
 
-    # Se <a> è dentro un <li>, prendiamo solo quel singolo <li>
-    if a_tag.parent and a_tag.parent.name == "li":
-      testo_contesto = a_tag.parent.get_text(" ", strip=True)
-    # Se <a> è dentro un <p>, prendiamo solo quel singolo <p>
-    elif a_tag.parent and a_tag.parent.name == "p":
-      testo_contesto = a_tag.parent.get_text(" ", strip=True)
+            trovati.append(
+                f"• <b>Atto:</b>\n{html.escape(testo_singolo)}\n"
+                f"👉 <a href='{link_completo}'>Apri documento</a>"
+            )
+
+    data_controllo = datetime.now(TIMEZONE).strftime("%d/%m/%Y %H:%M")
+    
+    if trovati:
+        risultati = "\n\n".join(trovati)
+        messaggio = (
+            f"📋 <b>{html.escape(intestazione_bollettino)}</b>\n"
+            f"🕒 <i>Aggiornato al: {data_controllo}</i>\n\n"
+            f"🔍 <b>Trovati {len(trovati)} atti per '{KEYWORD}':</b>\n\n"
+            f"{risultati}"
+        )
+        if len(messaggio) > 4000:
+            messaggio = messaggio[:3900] + f"\n\n... <i>(ulteriori risultati sul <a href='{URL_BOLLETTINO}'>sito del Bollettino</a>)</i>"
+        return messaggio
     else:
-      testo_contesto = testo_link
-
-    # Combiniamo i testi pertinenti del singolo bando
-    testo_bando = (
-        testo_contesto if len(testo_contesto) > len(testo_link) else testo_link
-    )
-
-    # Controllo presenza parola chiave
-    if KEYWORD.lower() in testo_bando.lower():
-      link_completo = urljoin(URL_BOLLETTINO, href)
-
-      # Evita duplicati dello stesso atto
-      if link_completo in link_univoci:
-        continue
-      link_univoci.add(link_completo)
-
-      # Pulizia spaziature e rimozione a capo multipli
-      testo_pulito = re.sub(r"\s+", " ", testo_bando).strip()
-      if len(testo_pulito) > 350:
-        testo_pulito = testo_pulito[:347] + "..."
-
-      trovati.append(
-          f"• <b>Atto:</b> {html.escape(testo_pulito)}\n  👉 <a"
-          f" href='{link_completo}'>Apri documento</a>"
-      )
-
-  data_controllo = datetime.now(TIMEZONE).strftime("%d/%m/%Y %H:%M")
-
-  if trovati:
-    risultati = "\n\n".join(trovati)
-    messaggio = (
-        f"📋 <b>{html.escape(intestazione_bollettino)}</b>\n"
-        f"🕒 <i>Aggiornato al: {data_controllo}</i>\n\n"
-        f"🔍 <b>Trovati {len(trovati)} atti per '{KEYWORD}':</b>\n\n"
-        f"{risultati}"
-    )
-    if len(messaggio) > 4000:
-      messaggio = (
-          messaggio[:3900]
-          + f"\n\n... <i>(ulteriori risultati sul <a href='{URL_BOLLETTINO}'>sito del Bollettino</a>)</i>"
-      )
-    return messaggio
-  else:
-    return (
-        f"📋 <b>{html.escape(intestazione_bollettino)}</b>\n"
-        f"🕒 <i>Aggiornato al: {data_controllo}</i>\n\n"
-        f"ℹ️ Nessun concorso o atto contenente la parola <b>'{KEYWORD}'</b>"
-        " trovato nell'edizione corrente."
-    )
+        return (
+            f"📋 <b>{html.escape(intestazione_bollettino)}</b>\n"
+            f"🕒 <i>Aggiornato al: {data_controllo}</i>\n\n"
+            f"ℹ️ Nessun concorso o atto contenente la parola <b>'{KEYWORD}'</b> trovato nell'edizione corrente."
+        )
 
 
 def invia_notifica_programmata():
