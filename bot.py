@@ -2,14 +2,15 @@ import os
 import sqlite3
 import logging
 import threading
+import time
 from urllib.parse import urljoin
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytz
 import requests
 from bs4 import BeautifulSoup
 import telebot
 from apscheduler.schedulers.background import BackgroundScheduler
+from flask import Flask
 
 # --- CONFIGURAZIONE ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8769617935:AAErJVJn_FVNOQCWlL3EcaqPZ_0MFXqA20A")
@@ -23,31 +24,18 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 bot = telebot.TeleBot(BOT_TOKEN)
+app = Flask(__name__)
+
+# Disabilita i log HTTP rumorosi di Flask
+log_flask = logging.getLogger('werkzeug')
+log_flask.setLevel(logging.ERROR)
 
 
-# --- 1. SERVER WEB PER RENDER (PORT BINDING) ---
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        # Risponde 204 No Content: zero dati inviati, nessun errore di output
-        self.send_response(204)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-
-    def do_HEAD(self):
-        # Supporta le richieste HEAD di cron-job.org / UptimeRobot
-        self.send_response(200)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-
-    def log_message(self, format, *args):
-        # Disabilita i log delle richieste HTTP per non intasare la console
-        return
-
-def avvia_server_web():
-    porta = int(os.getenv("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", porta), HealthCheckHandler)
-    logger.info(f"Server HTTP avviato sulla porta {porta}")
-    server.serve_forever()
+# --- 1. SERVER FLASK (Anti-Bad Gateway) ---
+@app.route('/')
+@app.route('/health')
+def health_check():
+    return "OK", 200
 
 
 # --- 2. GESTIONE DATABASE SQLITE ---
@@ -134,7 +122,7 @@ def cerca_nel_bollettino() -> str:
         )
 
 def invia_notifica_programmata():
-    logger.info("Esecuzione invio programmato...")
+    logger.info("Esecuzione invio programmato del giovedì...")
     messaggio = cerca_nel_bollettino()
     iscritti = get_tutti_iscritti()
     
@@ -157,7 +145,7 @@ def comando_start(message):
         testo = (
             "👋 <b>Benvenuto!</b>\n\n"
             f"Sei iscritto agli aggiornamenti per la parola <i>'{KEYWORD}'</i>.\n"
-            "Riceverai una notifica automatica <b>ogni giovedì alle 10:30</b>.\n\n"
+            "Riceverai una notifica automatica <b>ogni giovedì alle 10:00</b>.\n\n"
             "<b>Comandi:</b>\n"
             "👉 /cerca - Controlla subito il bollettino corrente\n"
             "👉 /stop - Cancella la tua iscrizione"
@@ -165,7 +153,7 @@ def comando_start(message):
     else:
         testo = (
             "Sei già iscritto!\n"
-            "Riceverai gli avvisi ogni giovedì alle 10:30.\n\n"
+            "Riceverai gli avvisi ogni giovedì alle 10:00.\n\n"
             "Usa /cerca per verificare ora o /stop per cancellarti."
         )
     bot.send_message(chat_id, testo, parse_mode="HTML")
@@ -184,21 +172,31 @@ def comando_cerca(message):
     bot.send_message(message.chat.id, esito, parse_mode="HTML", disable_web_page_preview=True)
 
 
-# --- 5. AVVIO APPLICAZIONE ---
+# --- 5. LOOP RESILIENTE TELEGRAM ---
+def avvia_polling_sicuro():
+    """Mantiene il bot in ascolto e lo riavvia se cade la connessione."""
+    while True:
+        try:
+            logger.info("Avvio connessione con i server di Telegram...")
+            bot.infinity_polling(timeout=20, long_polling_timeout=10, skip_pending=True)
+        except Exception as err:
+            logger.error(f"Errore nel polling: {err}. Riconnessione automatica tra 5 secondi...")
+            time.sleep(5)
+
+
+# --- 6. AVVIO APPLICAZIONE ---
 if __name__ == "__main__":
     init_db()
     
-    # 1. Avvio server Web in background per Render
-    threading.Thread(target=avvia_server_web, daemon=True).start()
-    
-    # 2. Configurazione controllo programmato (ogni giovedì alle 09:00 italiane)
+    # 1. Avvia Scheduler
     scheduler = BackgroundScheduler(timezone=TIMEZONE)
-    scheduler.add_job(invia_notifica_programmata, 'cron', day_of_week='thu', hour=10, minute=30)
+    scheduler.add_job(invia_notifica_programmata, 'cron', day_of_week='thu', hour=10, minute=0)
     scheduler.start()
     
-    # 3. Avvio ascolto messaggi Telegram
-    logger.info("Bot avviato e pronto all'uso.")
-    try:
-        bot.infinity_polling(timeout=20, long_polling_timeout=10)
-    except (KeyboardInterrupt, SystemExit):
-        scheduler.shutdown()
+    # 2. Avvia Telegram in un thread protetto
+    threading.Thread(target=avvia_polling_sicuro, daemon=True).start()
+    
+    # 3. Avvia Flask sul thread principale per soddisfare Render
+    porta = int(os.getenv("PORT", 10000))
+    logger.info(f"Avvio server Web Flask sulla porta {porta}")
+    app.run(host="0.0.0.0", port=porta)
