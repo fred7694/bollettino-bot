@@ -96,7 +96,6 @@ def get_tutti_iscritti():
     cursor.execute("SELECT chat_id FROM iscritti")
     return [row[0] for row in cursor.fetchall()]
 
-
 def cerca_nel_bollettino() -> str:
   headers = {
       "User-Agent": (
@@ -118,87 +117,90 @@ def cerca_nel_bollettino() -> str:
 
   soup = BeautifulSoup(response.text, "html.parser")
 
-  # 1. ESTRAZIONE PULITA DELLA DATA / NUMERO BOLLETTINO
+  # 1. ESTRAZIONE DATA E NUMERO BOLLETTINO
   intestazione_bollettino = "Bollettino Ufficiale - Regione Piemonte"
-  testo_completo = soup.get_text(" ", strip=True)
+  testo_pagina = soup.get_text(" ", strip=True)
 
-  # Cerca "Bollettino Ufficiale [Supplemento] n. X del GG mese AAAA"
+  # Pattern rigoroso che intercetta solo la dicitura della testata
   match_data = re.search(
       r"Bollettino\s+Ufficiale(?:\s+ordinario|\s+straordinario|\s+speciale|\s+supplemento)?\s+n\.?\s*\d+(?:\s+del|\s+Supplemento\s+n\.?\s*\d+\s+del)?\s+\d{1,2}\s+[a-zA-ZÀ-ÿ]+\s+\d{4}",
-      testo_completo,
+      testo_pagina,
       re.IGNORECASE,
   )
 
   if match_data:
     intestazione_bollettino = re.sub(r"\s+", " ", match_data.group(0)).strip()
   else:
-    # Fallback se non trova il pattern completo
-    first_heading = soup.find(["h1", "h2", "h3", "title"])
-    if first_heading:
-      intestazione_bollettino = first_heading.get_text(" ", strip=True)
+    for header_tag in soup.find_all(["h1", "h2", "h3", "caption"]):
+      t = header_tag.get_text(" ", strip=True)
+      if "bollettino" in t.lower():
+        intestazione_bollettino = t
+        break
 
-  # 2. RICERCA ATTI E CONCORSI
-  # Cerca nei contenitori tipici degli atti (elementi di lista, paragrafi o righe tabella)
-  contenitori = soup.find_all(["li", "p", "tr"])
+  # 2. RICERCA ATTI SENZA DUPLICAZIONI
   trovati = []
-  link_visti = set()
+  link_registrati = set()
 
-  for elemento in contenitori:
-    testo_elemento = elemento.get_text(" ", strip=True)
+  # Seleziona gli elementi contenitore principali (evitando tag padre generici)
+  voci_bando = soup.find_all(["li", "tr", "dd", "p"])
 
-    # Verifica se la parola chiave è presente nel testo del bando
-    if KEYWORD.lower() in testo_elemento.lower():
-      # Cerca se dentro questo blocco c'è un link all'atto
-      link_tag = elemento.find("a")
+  for voce in voci_bando:
+    # Se il contenitore ha sotto-elementi 'li' o 'p' che contengono la parola,
+    # salta il genitore per evitare doppioni
+    if voce.name in ["li", "tr"] and voce.find(["li", "p", "dd"]):
+      continue
+
+    testo_voce = voce.get_text(" ", strip=True)
+
+    if KEYWORD.lower() in testo_voce.lower():
+      # 1. Cerca il tag <a> dentro la voce
+      link_tag = voce.find("a")
+
+      # 2. Se non c'è, cerca nel nodo genitore o nei fratelli vicini
+      if not link_tag:
+        genitore = voce.find_parent(["li", "tr", "div"])
+        if genitore:
+          link_tag = genitore.find("a")
+
+      # Determina la URL dell'atto
       if link_tag and link_tag.get("href"):
-        link_completo = urljoin(URL_BOLLETTINO, link_tag.get("href"))
+        href = link_tag.get("href")
+        link_completo = urljoin(URL_BOLLETTINO, href)
       else:
-        # Se non c'è un link interno, rimanda alla pagina del bollettino
         link_completo = URL_BOLLETTINO
 
-      # Evita duplicati se lo stesso atto compare in tag annidati
-      if link_completo not in link_visti or link_completo == URL_BOLLETTINO:
-        # Pulisce gli spazi e tronca descrizioni eccessivamente lunghe
-        testo_pulito = re.sub(r"\s+", " ", testo_elemento).strip()
-        if len(testo_pulito) > 300:
-          testo_pulito = testo_pulito[:297] + "..."
+      # Evita di inserire due volte lo stesso link
+      if link_completo in link_registrati:
+        continue
 
-        testo_escape = html.escape(testo_pulito)
-        trovati.append(
-            f"• <a href='{link_completo}'>{testo_escape}</a>\n  🔗 <a"
-            f" href='{link_completo}'>Apri documento</a>"
-        )
-        link_visti.add(link_completo)
+      link_registrati.add(link_completo)
 
-  # Se non trova nei contenitori a blocchi, fallback su ricerca classica dei link diretti
-  if not trovati:
-    for link in soup.find_all("a"):
-      testo_link = link.get_text(" ", strip=True)
-      href = link.get("href", "")
-      if (
-          KEYWORD.lower() in testo_link.lower()
-          and href
-          and href not in link_visti
-      ):
-        link_completo = urljoin(URL_BOLLETTINO, href)
-        trovati.append(f"• <a href='{link_completo}'>{html.escape(testo_link)}</a>")
-        link_visti.add(href)
+      # Pulizia testo
+      testo_pulito = re.sub(r"\s+", " ", testo_voce).strip()
+      if len(testo_pulito) > 350:
+        testo_pulito = testo_pulito[:347] + "..."
+
+      trovati.append(
+          f"🔹 <b>Atto/Bando:</b>\n"
+          f"{html.escape(testo_pulito)}\n"
+          f"👉 <a href='{link_completo}'>Leggi il documento</a>"
+      )
 
   data_controllo = datetime.now(TIMEZONE).strftime("%d/%m/%Y %H:%M")
 
-  # 3. FORMATTAZIONE DEL MESSAGGIO
+  # 3. COMPOSIZIONE MESSAGGIO
   if trovati:
     risultati = "\n\n".join(trovati)
     messaggio = (
         f"📋 <b>{html.escape(intestazione_bollettino)}</b>\n"
         f"🕒 <i>Verificato il: {data_controllo}</i>\n\n"
-        f"🔍 <b>Trovati {len(trovati)} atti per '{KEYWORD}':</b>\n\n"
+        f"🔍 <b>Trovati {len(trovati)} risultati per '{KEYWORD}':</b>\n\n"
         f"{risultati}"
     )
     if len(messaggio) > 4000:
       messaggio = (
           messaggio[:3900]
-          + f"\n\n... <i>(visualizza gli altri sul <a href='{URL_BOLLETTINO}'>sito del Bollettino</a>)</i>"
+          + f"\n\n... <i>(visualizza gli altri sul <a href='{URL_BOLLETTINO}'>sito</a>)</i>"
       )
     return messaggio
   else:
