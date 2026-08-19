@@ -126,8 +126,8 @@ def cerca_nel_bollettino() -> str:
     try:
         response = requests.get(URL_BOLLETTINO, headers=headers, timeout=20)
         response.raise_for_status()
-        # Il Bollettino Piemonte usa la codifica ISO-8859-1 / Latin-1 per le lettere accentate e virgolette
-        response.encoding = 'iso-8859-1'
+        # Risolve la codifica dei caratteri speciali e accentati del Bollettino
+        response.encoding = 'windows-1252' if 'windows-1252' in response.text.lower() else 'iso-8859-1'
     except requests.RequestException as e:
         logger.error(f"Errore connessione bollettino: {e}")
         return f"⚠️ <b>Errore:</b> Impossibile raggiungere il sito del Bollettino.\n<code>{e}</code>"
@@ -135,54 +135,72 @@ def cerca_nel_bollettino() -> str:
     soup = BeautifulSoup(response.text, "html.parser")
     intestazione_bollettino = estrai_data_bollettino(soup)
 
+    # 1. Suddivisione dell'HTML nei singoli blocchi di bandi
+    # Nelle pagine regionali i singoli concorsi sono divisi da tag <hr> o contenuti in blocchi/paragrafi distinti
+    raw_html = str(soup)
+    blocchi_html = re.split(r'<hr[^>]*>', raw_html, flags=re.IGNORECASE)
+
     trovati = []
-    link_univoci = set()
+    link_visti = set()
 
-    # Cerca tutti i link che portano a un file/dettaglio atto (.htm, .html, .pdf, .rtf)
-    for a_tag in soup.find_all("a", href=True):
-        href = a_tag.get("href", "").strip()
-        
-        # Ignora ancore interne, javascript e pagine indice generali
-        if not href or href.startswith("#") or "javascript" in href.lower() or "index" in href.lower():
-            continue
-
-        link_completo = urljoin(URL_BOLLETTINO, href)
-        if link_completo in link_univoci:
-            continue
-
-        # RECUPERO DEL TESTO DEL SINGOLO BANDO:
-        # 1. Se il testo è dentro al tag <a> stesso
-        testo_singolo = a_tag.get_text(" ", strip=True)
-        
-        # 2. Se <a> è solo un pulsante/codice (es. "Scarica", o codice atto),
-        # raccogliamo il testo immediatamente precedente risalendo fino al bando precedente
-        if len(testo_singolo) < 15:
-            parti_testo = []
-            for prev in a_tag.previous_siblings:
-                # Se incontra un altro link, un'interruzione di sezione <hr> o intestazioni di tabella, si ferma
-                if getattr(prev, 'name', None) in ['a', 'hr', 'h1', 'h2', 'h3', 'table']:
-                    break
-                t = prev.get_text(" ", strip=True) if hasattr(prev, 'get_text') else str(prev).strip()
-                if t:
-                    parti_testo.insert(0, t)
-            
-            if parti_testo:
-                testo_singolo = " ".join(parti_testo)
-
-        # Pulizia caratteri di spaziatura
-        testo_singolo = re.sub(r"\s+", " ", testo_singolo).strip()
+    for blocco in blocchi_html:
+        blocco_soup = BeautifulSoup(blocco, "html.parser")
+        testo_blocco = blocco_soup.get_text(" ", strip=True)
 
         # Verifica se la parola chiave è presente nel singolo bando
-        if KEYWORD.lower() in testo_singolo.lower():
-            link_univoci.add(link_completo)
-            
-            if len(testo_singolo) > 350:
-                testo_singolo = testo_singolo[:347] + "..."
+        if KEYWORD.lower() in testo_blocco.lower():
+            # Cerca il link al file del bando (.htm, .html, .pdf, .rtf)
+            link_atto = None
+            for a in blocco_soup.find_all("a", href=True):
+                href = a.get("href", "").strip()
+                if (
+                    href
+                    and not href.startswith("#")
+                    and "javascript" not in href.lower()
+                    and not href.lower().endswith("index.htm")
+                    and not href.lower().endswith("index.html")
+                ):
+                    link_atto = urljoin(URL_BOLLETTINO, href)
+                    break
+
+            # Se non trova un link interno al blocco, usa l'URL generale come riferimento
+            destinazione_link = link_atto if link_atto else URL_BOLLETTINO
+
+            if destinazione_link in link_visti and destinazione_link != URL_BOLLETTINO:
+                continue
+            link_visti.add(destinazione_link)
+
+            # Pulizia e formattazione del testo del bando
+            testo_pulito = re.sub(r"\s+", " ", testo_blocco).strip()
+            # Rimuove l'eventuale intestazione della pagina se è rimasta nel primo blocco
+            testo_pulito = re.sub(r"^Bollettino\s+Ufficiale[^\n]*?\d{4}\s*", "", testo_pulito, flags=re.IGNORECASE).strip()
+
+            if len(testo_pulito) > 350:
+                testo_pulito = testo_pulito[:347] + "..."
 
             trovati.append(
-                f"• <b>Atto:</b>\n{html.escape(testo_singolo)}\n"
-                f"👉 <a href='{link_completo}'>Apri documento</a>"
+                f"• <b>Atto:</b>\n{html.escape(testo_pulito)}\n"
+                f"  👉 <a href='{destinazione_link}'>Apri documento</a>"
             )
+
+    # 2. Fallback di sicurezza: se la pagina non usava tag <hr>, itera sui singoli paragrafi/elenchi
+    if not trovati:
+        for elemento in soup.find_all(["li", "dd", "p"]):
+            testo_el = elemento.get_text(" ", strip=True)
+            if KEYWORD.lower() in testo_el.lower() and len(testo_el) < 1500:
+                link_tag = elemento.find("a", href=True)
+                href = link_tag.get("href", "") if link_tag else ""
+                destinazione_link = urljoin(URL_BOLLETTINO, href) if href and "index" not in href.lower() else URL_BOLLETTINO
+                
+                if destinazione_link not in link_visti:
+                    link_visti.add(destinazione_link)
+                    testo_pulito = re.sub(r"\s+", " ", testo_el).strip()
+                    if len(testo_pulito) > 350:
+                        testo_pulito = testo_pulito[:347] + "..."
+                    trovati.append(
+                        f"• <b>Atto:</b>\n{html.escape(testo_pulito)}\n"
+                        f"  👉 <a href='{destinazione_link}'>Apri documento</a>"
+                    )
 
     data_controllo = datetime.now(TIMEZONE).strftime("%d/%m/%Y %H:%M")
     
