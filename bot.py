@@ -28,10 +28,16 @@ bot = telebot.TeleBot(BOT_TOKEN)
 # --- 1. SERVER WEB PER RENDER (PORT BINDING) ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain; charset=utf-8")
+        # Risponde 204 No Content: zero dati inviati, nessun errore di output
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
         self.end_headers()
-        self.wfile.write("Bot attivo e in ascolto!".encode("utf-8"))
+
+    def do_HEAD(self):
+        # Supporta le richieste HEAD di cron-job.org / UptimeRobot
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def log_message(self, format, *args):
         # Disabilita i log delle richieste HTTP per non intasare la console
