@@ -12,7 +12,7 @@ import telebot
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # --- CONFIGURAZIONE ---
-BOT_TOKEN = os.getenv("BOT_TOKEN", "INSERISCI_QUI_IL_TUO_BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8769617935:AAErJVJn_FVNOQCWlL3EcaqPZ_0MFXqA20A")
 URL_BOLLETTINO = "https://www.regione.piemonte.it/governo/bollettino/abbonati/2026/corrente/"
 KEYWORD = "chirurgia"
 DB_FILE = "iscritti.db"
