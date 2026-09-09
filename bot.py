@@ -26,7 +26,14 @@ ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
 
 BASE_URL_CONCORSI = "https://www.regione.piemonte.it/governo/bollettino/abbonati/2026/corrente/concorsi/"
 URL_INDICE = urljoin(BASE_URL_CONCORSI, "index.htm")
-KEYWORD = "chirurgia"
+# --- CONFIGURAZIONE ---
+RADICI_RICERCA = ["chirur", "senol"]
+# Crea una regex del tipo: r"\b(chirur\w*|senol\w*)"
+PATTERN_RICERCA = re.compile(
+    rf"\b({'|'.join(RADICI_RICERCA)})\w*",
+    re.IGNORECASE
+)
+DESCRIZIONE_RICERCA = "chirur* / senol*"
 DB_FILE = "iscritti.db"
 TIMEZONE = pytz.timezone("Europe/Rome")
 
@@ -143,87 +150,102 @@ def ottieni_lista_url_atti(session: requests.Session) -> tuple[str, list[str]]:
 
 
 def cerca_nel_bollettino() -> tuple[str, list[dict]]:
-  session = requests.Session()
-  session.headers.update({
-      "User-Agent": (
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,"
-          " like Gecko) Chrome/120.0.0.0 Safari/537.36"
-      )
-  })
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    })
+    
+    intestazione, lista_urls = ottieni_lista_url_atti(session)
+    trovati = []
 
-  intestazione, lista_urls = ottieni_lista_url_atti(session)
-  trovati = []
+    for url_atto in lista_urls:
+        try:
+            r = session.get(url_atto, timeout=10)
+            if r.status_code == 404:
+                break
+            if r.status_code != 200:
+                continue
 
-  for url_atto in lista_urls:
-    try:
-      r = session.get(url_atto, timeout=10)
-      if r.status_code == 404:
-        break
-      if r.status_code != 200:
-        continue
+            r.encoding = 'iso-8859-1'
+            testo_pagina = r.text
 
-      r.encoding = "iso-8859-1"
-      testo_pagina = r.text
+            # Controllo con regex: cerca qualsiasi parola che inizi per le radici configurate
+            match = PATTERN_RICERCA.search(testo_pagina)
+            if match:
+                parola_trovata = match.group(0) # Es. "chirurgia", "chirurgo", "senologia"
+                soup_atto = BeautifulSoup(testo_pagina, "html.parser")
+                
+                for tag in soup_atto(["script", "style", "meta", "link", "noscript"]):
+                    tag.decompose()
 
-      if KEYWORD.lower() in testo_pagina.lower():
-        soup_atto = BeautifulSoup(testo_pagina, "html.parser")
-        for tag in soup_atto(["script", "style", "meta", "link", "noscript"]):
-          tag.decompose()
+                testo_pulito = re.sub(r'\n\s*\n+', '\n\n', soup_atto.get_text('\n', strip=True)).strip()
+                if len(testo_pulito) > 3700:
+                    testo_pulito = testo_pulito[:3650] + "\n\n... [Testo lungo: visualizza il documento completo al link]"
 
-        testo_pulito = re.sub(
-            r"\n\s*\n+", "\n\n", soup_atto.get_text("\n", strip=True)
-        ).strip()
-        if len(testo_pulito) > 3700:
-          testo_pulito = (
-              testo_pulito[:3650]
-              + "\n\n... [Testo lungo: visualizza il documento completo al link]"
-          )
+                trovati.append({
+                    "testo": testo_pulito,
+                    "url": url_atto,
+                    "match": parola_trovata
+                })
+        except requests.RequestException as e:
+            logger.error(f"Errore controllo URL {url_atto}: {e}")
+            continue
 
-        trovati.append({"testo": testo_pulito, "url": url_atto})
-    except requests.RequestException as e:
-      logger.error(f"Errore controllo URL {url_atto}: {e}")
-      continue
-
-  return intestazione, trovati
+    return intestazione, trovati
 
 
 def invia_esito_a_chat(chat_id: int, intestazione: str, trovati: list[dict]):
-  data_controllo = datetime.now(TIMEZONE).strftime("%d/%m/%Y %H:%M")
+    data_controllo = datetime.now(TIMEZONE).strftime("%d/%m/%Y %H:%M")
+    
+    if not trovati:
+        messaggio = (
+            f"📋 <b>{html.escape(intestazione)}</b>\n"
+            f"🕒 <i>Controllo del: {data_controllo}</i>\n\n"
+            f"ℹ️ Nessun concorso o atto contenente parole con <b>{DESCRIZIONE_RICERCA}</b> trovato nell'edizione corrente."
+        )
+        bot.send_message(chat_id, messaggio, parse_mode="HTML", disable_web_page_preview=True)
+        return
 
-  if not trovati:
-    messaggio = (
+    messaggio_intro = (
         f"📋 <b>{html.escape(intestazione)}</b>\n"
         f"🕒 <i>Controllo del: {data_controllo}</i>\n\n"
-        f"ℹ️ Nessun concorso o atto contenente la parola <b>'{KEYWORD}'</b>"
-        " trovato nell'edizione corrente."
+        f"🔍 <b>Trovati {len(trovati)} atti per '{DESCRIZIONE_RICERCA}':</b>"
     )
-    bot.send_message(
-        chat_id, messaggio, parse_mode="HTML", disable_web_page_preview=True
-    )
-    return
+    bot.send_message(chat_id, messaggio_intro, parse_mode="HTML", disable_web_page_preview=True)
 
-  messaggio_intro = (
-      f"📋 <b>{html.escape(intestazione)}</b>\n"
-      f"🕒 <i>Controllo del: {data_controllo}</i>\n\n"
-      f"🔍 <b>Trovati {len(trovati)} atti per '{KEYWORD}':</b>"
-  )
-  bot.send_message(
-      chat_id, messaggio_intro, parse_mode="HTML", disable_web_page_preview=True
-  )
+    for idx, bando in enumerate(trovati, 1):
+        testo_formattato = (
+            f"📄 <b>Bando {idx} di {len(trovati)}</b> <i>(trovata corrispondenza: '{bando['match']}')</i>:\n\n"
+            f"{html.escape(bando['testo'])}\n\n"
+            f"👉 <a href='{bando['url']}'>Apri documento originale</a>"
+        )
+        bot.send_message(chat_id, testo_formattato, parse_mode="HTML", disable_web_page_preview=True)
+        time.sleep(0.3)
 
-  for idx, bando in enumerate(trovati, 1):
-    testo_formattato = (
-        f"📄 <b>Bando {idx} di {len(trovati)}:</b>\n\n"
-        f"{html.escape(bando['testo'])}\n\n"
-        f"👉 <a href='{bando['url']}'>Apri documento originale</a>"
-    )
-    bot.send_message(
-        chat_id,
-        testo_formattato,
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
-    time.sleep(0.3)
+
+@bot.message_handler(commands=['start'])
+def comando_start(message):
+    chat_id = message.chat.id
+    username = message.from_user.username
+    is_nuovo = aggiungi_utente(chat_id, username)
+    
+    if is_nuovo:
+        testo = (
+            "👋 <b>Benvenuto!</b>\n\n"
+            f"Sei iscritto agli aggiornamenti per: <b>{DESCRIZIONE_RICERCA}</b>.\n"
+            f"Il tuo ID Telegram: <code>{chat_id}</code>\n"
+            "Riceverai una notifica automatica <b>ogni giovedì alle 10:00</b>.\n\n"
+            "👉 /cerca - Controlla subito\n"
+            "👉 /stop - Cancellati"
+        )
+    else:
+        testo = (
+            f"Sei già iscritto! (ID: <code>{chat_id}</code>)\n"
+            f"Ricerca attiva per: <b>{DESCRIZIONE_RICERCA}</b>\n\n"
+            "👉 Usa /cerca per controllare subito\n"
+            "👉 Usa /stop per cancellarti"
+        )
+    bot.send_message(chat_id, testo, parse_mode="HTML")
 
 
 def invia_notifica_programmata():
