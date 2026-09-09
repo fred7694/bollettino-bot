@@ -21,6 +21,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
   raise ValueError("Errore: BOT_TOKEN mancante nel file .env o nell'ambiente.")
 
+# Inserisci il tuo chat_id numerico come fallback di emergenza nelle env o qui
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
+
 BASE_URL_CONCORSI = "https://www.regione.piemonte.it/governo/bollettino/abbonati/2026/corrente/concorsi/"
 URL_INDICE = urljoin(BASE_URL_CONCORSI, "index.htm")
 KEYWORD = "chirurgia"
@@ -74,6 +77,9 @@ def aggiungi_utente(chat_id: int, username: str) -> bool:
         (chat_id, username or "Sconosciuto", now),
     )
     conn.commit()
+    logger.info(
+        f"Nuovo utente iscritto al database: {chat_id} (@{username})"
+    )
     return True
 
 
@@ -82,19 +88,27 @@ def rimuovi_utente(chat_id: int) -> bool:
     cursor = conn.cursor()
     cursor.execute("DELETE FROM iscritti WHERE chat_id = ?", (chat_id,))
     conn.commit()
+    logger.info(f"Utente rimosso: {chat_id}")
     return cursor.rowcount > 0
 
 
-def get_tutti_iscritti():
+def get_tutti_iscritti() -> list[int]:
   with sqlite3.connect(DB_FILE) as conn:
     cursor = conn.cursor()
     cursor.execute("SELECT chat_id FROM iscritti")
-    return [row[0] for row in cursor.fetchall()]
+    iscritti = [row[0] for row in cursor.fetchall()]
+
+  # Aggiunge l'ADMIN_CHAT_ID se configurato per evitare di perdere la notifica in caso di wipe del DB
+  if ADMIN_CHAT_ID and ADMIN_CHAT_ID.isdigit():
+    admin_id = int(ADMIN_CHAT_ID)
+    if admin_id not in iscritti:
+      iscritti.append(admin_id)
+
+  return iscritti
 
 
 # --- SCRAPING CON ITERAZIONE SUI SINGOLI DOCUMENTI ---
 def ottieni_lista_url_atti(session: requests.Session) -> tuple[str, list[str]]:
-  """Legge l'indice generale, estrae la data del bollettino e genera la lista dei link agli atti."""
   intestazione = "Bollettino Ufficiale - Regione Piemonte"
   links_atti = []
 
@@ -104,7 +118,6 @@ def ottieni_lista_url_atti(session: requests.Session) -> tuple[str, list[str]]:
       resp.encoding = "iso-8859-1"
       soup = BeautifulSoup(resp.text, "html.parser")
 
-      # Estrazione data/numero bollettino
       match_data = re.search(
           r"Bollettino\s+Ufficiale[^\n\r]*?n\.?\s*\d+[^\n\r]*?del\s+\d{1,2}\s+[a-zA-ZÀ-ÿ]+\s+\d{4}",
           soup.get_text("\n", strip=True),
@@ -113,7 +126,6 @@ def ottieni_lista_url_atti(session: requests.Session) -> tuple[str, list[str]]:
       if match_data:
         intestazione = re.sub(r"\s+", " ", match_data.group(0)).strip()
 
-      # Raccoglie i link agli atti (es. 00000001.htm, 00000002.htm...)
       for a in soup.find_all("a", href=True):
         href = a.get("href", "").strip()
         if re.search(r"\d+\.htm[l]?", href, re.IGNORECASE):
@@ -121,9 +133,8 @@ def ottieni_lista_url_atti(session: requests.Session) -> tuple[str, list[str]]:
           if full_url not in links_atti:
             links_atti.append(full_url)
   except Exception as e:
-    logger.warning(f"Errore lettura indice, fallback su iterazione numerica: {e}")
+    logger.warning(f"Errore lettura indice: {e}")
 
-  # Se l'indice non conteneva i link, genera i primi 100 in sequenza progressiva
   if not links_atti:
     for i in range(1, 101):
       links_atti.append(urljoin(BASE_URL_CONCORSI, f"{i:08d}.htm"))
@@ -131,7 +142,7 @@ def ottieni_lista_url_atti(session: requests.Session) -> tuple[str, list[str]]:
   return intestazione, links_atti
 
 
-def cerca_nel_bollettino() -> str:
+def cerca_nel_bollettino() -> tuple[str, list[dict]]:
   session = requests.Session()
   session.headers.update({
       "User-Agent": (
@@ -146,8 +157,6 @@ def cerca_nel_bollettino() -> str:
   for url_atto in lista_urls:
     try:
       r = session.get(url_atto, timeout=10)
-
-      # Se la pagina non esiste (404), interrompe la sequenza numerica
       if r.status_code == 404:
         break
       if r.status_code != 200:
@@ -156,78 +165,98 @@ def cerca_nel_bollettino() -> str:
       r.encoding = "iso-8859-1"
       testo_pagina = r.text
 
-      # Verifica se la parola chiave è presente nel testo integrale dell'atto
       if KEYWORD.lower() in testo_pagina.lower():
         soup_atto = BeautifulSoup(testo_pagina, "html.parser")
+        for tag in soup_atto(["script", "style", "meta", "link", "noscript"]):
+          tag.decompose()
 
-        # Rimuove script e stili
-        for s in soup_atto(["script", "style"]):
-          s.decompose()
-
-        # Estrae l'oggetto o titolo del bando dalla pagina
-        titolo_atto = ""
-        # Cerca tag di intestazione o primo paragrafo significativo
-        tag_titolo = soup_atto.find(["h1", "h2", "h3", "title"])
-        if tag_titolo:
-          titolo_atto = tag_titolo.get_text(" ", strip=True)
-
-        if not titolo_atto or len(titolo_atto) < 20:
-          # Prende il primo testo visibile significativo
-          testo_pulito = re.sub(
-              r"\s+", " ", soup_atto.get_text(" ", strip=True)
-          ).strip()
-          titolo_atto = testo_pulito[:250] + (
-              "..." if len(testo_pulito) > 250 else ""
+        testo_pulito = re.sub(
+            r"\n\s*\n+", "\n\n", soup_atto.get_text("\n", strip=True)
+        ).strip()
+        if len(testo_pulito) > 3700:
+          testo_pulito = (
+              testo_pulito[:3650]
+              + "\n\n... [Testo lungo: visualizza il documento completo al link]"
           )
 
-        titolo_pulito = re.sub(r"\s+", " ", titolo_atto).strip()
-        trovati.append(
-            f"• <b>Atto trovato:</b>\n{html.escape(titolo_pulito)}\n  👉 <a"
-            f" href='{url_atto}'>Apri documento completo</a>"
-        )
-
+        trovati.append({"testo": testo_pulito, "url": url_atto})
     except requests.RequestException as e:
       logger.error(f"Errore controllo URL {url_atto}: {e}")
       continue
 
+  return intestazione, trovati
+
+
+def invia_esito_a_chat(chat_id: int, intestazione: str, trovati: list[dict]):
   data_controllo = datetime.now(TIMEZONE).strftime("%d/%m/%Y %H:%M")
 
-  if trovati:
-    risultati = "\n\n".join(trovati)
+  if not trovati:
     messaggio = (
-        f"📋 <b>{html.escape(intestazione)}</b>\n"
-        f"🕒 <i>Controllo del: {data_controllo}</i>\n\n"
-        f"🔍 <b>Trovati {len(trovati)} atti per '{KEYWORD}':</b>\n\n"
-        f"{risultati}"
-    )
-    if len(messaggio) > 4000:
-      messaggio = (
-          messaggio[:3900]
-          + f"\n\n... <i>(ulteriori risultati sul <a href='{URL_INDICE}'>sito</a>)</i>"
-      )
-    return messaggio
-  else:
-    return (
         f"📋 <b>{html.escape(intestazione)}</b>\n"
         f"🕒 <i>Controllo del: {data_controllo}</i>\n\n"
         f"ℹ️ Nessun concorso o atto contenente la parola <b>'{KEYWORD}'</b>"
         " trovato nell'edizione corrente."
     )
+    bot.send_message(
+        chat_id, messaggio, parse_mode="HTML", disable_web_page_preview=True
+    )
+    return
+
+  messaggio_intro = (
+      f"📋 <b>{html.escape(intestazione)}</b>\n"
+      f"🕒 <i>Controllo del: {data_controllo}</i>\n\n"
+      f"🔍 <b>Trovati {len(trovati)} atti per '{KEYWORD}':</b>"
+  )
+  bot.send_message(
+      chat_id, messaggio_intro, parse_mode="HTML", disable_web_page_preview=True
+  )
+
+  for idx, bando in enumerate(trovati, 1):
+    testo_formattato = (
+        f"📄 <b>Bando {idx} di {len(trovati)}:</b>\n\n"
+        f"{html.escape(bando['testo'])}\n\n"
+        f"👉 <a href='{bando['url']}'>Apri documento originale</a>"
+    )
+    bot.send_message(
+        chat_id,
+        testo_formattato,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+    time.sleep(0.3)
 
 
 def invia_notifica_programmata():
-  logger.info("Esecuzione notifica programmata...")
-  messaggio = cerca_nel_bollettino()
-  iscritti = get_tutti_iscritti()
+  logger.info("AVVIO NOTIFICA PROGRAMMATA DEL GIOVEDÌ...")
+  try:
+    iscritti = get_tutti_iscritti()
+    logger.info(
+        f"Numero iscritti destinatari: {len(iscritti)} -> {iscritti}"
+    )
 
-  for chat_id in iscritti:
-    try:
-      bot.send_message(
-          chat_id, messaggio, parse_mode="HTML", disable_web_page_preview=True
+    if not iscritti:
+      logger.warning(
+          "Nessun utente iscritto nel database. Notifica annullata."
       )
-    except telebot.apihelper.ApiTelegramException as e:
-      if e.error_code in [403, 400]:
-        rimuovi_utente(chat_id)
+      return
+
+    intestazione, trovati = cerca_nel_bollettino()
+
+    for chat_id in iscritti:
+      try:
+        invia_esito_a_chat(chat_id, intestazione, trovati)
+        logger.info(f"Notifica inviata con successo a chat_id: {chat_id}")
+      except telebot.apihelper.ApiTelegramException as e:
+        logger.error(
+            f"Errore invio Telegram a {chat_id}: {e.description} (Code:"
+            f" {e.error_code})"
+        )
+        if e.error_code in [403, 400]:
+          rimuovi_utente(chat_id)
+      except Exception as ex:
+        logger.error(f"Errore generico invio a {chat_id}: {ex}")
+  except Exception as e:
+    logger.error(f"Errore critico durante l'esecuzione programmata: {e}")
 
 
 # --- COMANDI TELEGRAM ---
@@ -240,19 +269,41 @@ def comando_start(message):
   if is_nuovo:
     testo = (
         "👋 <b>Benvenuto!</b>\n\n"
-        f"Sei iscritto agli aggiornamenti per la parola <i>'{KEYWORD}'</i> nella"
-        " sezione <b>Concorsi</b>.\n"
+        f"Sei stato iscritto con successo agli aggiornamenti per"
+        f" <i>'{KEYWORD}'</i>.\n"
+        f"Il tuo ID Telegram: <code>{chat_id}</code>\n"
         "Riceverai una notifica automatica <b>ogni giovedì alle 10:00</b>.\n\n"
-        "👉 Usa /cerca per controllare subito\n"
-        "👉 Usa /stop per cancellarti"
+        "👉 /cerca - Controlla subito\n"
+        "👉 /stop - Cancellati"
     )
   else:
     testo = (
-        "Sei già iscritto!\n\n"
-        "👉 Usa /cerca per verificare subito\n"
+        f"Sei già iscritto! (ID: <code>{chat_id}</code>)\n\n"
+        "👉 Usa /cerca per controllare subito\n"
         "👉 Usa /stop per cancellarti"
     )
   bot.send_message(chat_id, testo, parse_mode="HTML")
+
+
+@bot.message_handler(commands=["iscritti"])
+def comando_iscritti(message):
+  """Permette di visualizzare gli ID iscritti per debug."""
+  iscritti = get_tutti_iscritti()
+  bot.send_message(
+      message.chat.id,
+      f"📊 <b>Iscritti nel DB:</b> {len(iscritti)}\n<code>{iscritti}</code>",
+      parse_mode="HTML",
+  )
+
+
+@bot.message_handler(commands=["test_notifica"])
+def comando_test_notifica(message):
+  """Forza l'esecuzione della funzione del giovedì per testare l'invio a tutti gli iscritti."""
+  bot.send_message(
+      message.chat.id,
+      "⚡ Esecuzione manuale del ciclo di notifica del giovedì in corso...",
+  )
+  invia_notifica_programmata()
 
 
 @bot.message_handler(commands=["stop"])
@@ -273,10 +324,8 @@ def comando_cerca(message):
       message.chat.id,
       "🔍 Controllo in corso su tutti i singoli atti del Bollettino...",
   )
-  esito = cerca_nel_bollettino()
-  bot.send_message(
-      message.chat.id, esito, parse_mode="HTML", disable_web_page_preview=True
-  )
+  intestazione, trovati = cerca_nel_bollettino()
+  invia_esito_a_chat(message.chat.id, intestazione, trovati)
 
 
 def avvia_polling_sicuro():
@@ -294,11 +343,18 @@ def avvia_polling_sicuro():
 if __name__ == "__main__":
   init_db()
 
+  # Pianificazione scheduler giovedì ore 10:00 (Europe/Rome)
   scheduler = BackgroundScheduler(timezone=TIMEZONE)
   scheduler.add_job(
-      invia_notifica_programmata, "cron", day_of_week="thu", hour=10, minute=0
+      invia_notifica_programmata,
+      "cron",
+      day_of_week="thu",
+      hour=10,
+      minute=0,
+      misfire_grace_time=3600,  # Se il server era in sleep/riavvio, esegue il job se entro 1 ora
   )
   scheduler.start()
+  logger.info("Scheduler avviato con successo.")
 
   threading.Thread(target=avvia_polling_sicuro, daemon=True).start()
 
